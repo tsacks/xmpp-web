@@ -90,6 +90,7 @@ export default defineConfig({
       },
     },
   },
+  dedupe: ['@xmpp/xml', 'ltx'],
   build: {
     sourcemap: 'hidden',
     rollupOptions: {
