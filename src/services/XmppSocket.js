@@ -1,5 +1,6 @@
 import { XmppClient as XMPP, NS } from './XmppClient'
 import defaultAvatar from '../assets/defaultAvatar'
+import RingingAlert from '@/components/Registered/RingingAlert.vue'
 
 const transports = window.config.transports
 const resource = window.config.resource
@@ -297,15 +298,32 @@ export default {
 
     // listen for retracted messages
     this.client.on('messageRetracted', (retracted) => {
-      const index = this.context.$store.messages.findIndex((message) => message.from.bare === retracted.from && message.stanzaId === retracted.stanzaId)
+      console.log('messageRetracted', retracted)
+      //Unfortunately, [XEP-0353 Jingle Message Initiation] reuses its own ID on the <propose/> element, rather than the ID on the <message/> element.
+      //This means we have to handle messages differently, depending on if it's a regular message, or a Jingle message.
+      //Also, this is probably one of the worst ways to handle this separation, but it can be cleaned up later.
+      let index, body
+      if(retracted.stanzaId){
+        index = this.context.$store.messages.findIndex((message) => message.from.bare === retracted.from && message.stanzaId === retracted.stanzaId)
+        body = `Moderated by ${retracted.by.resource}` + (retracted.reason ? ` (${retracted.reason})` : '')
+      }
+      else if (retracted.jingleId) {
+        index = this.context.$store.messages.findIndex((message) => message.from.bare === retracted.from && message.stanzaId === retracted.jingleId)
+        body = `Missed call from ${retracted.from}`
+      }
+      else {
+        index = -1
+        body = ''
+      }
+      console.log('index',index)
       if (index === -1) {
         // original message is not found (unknown or retracted sent by a third party)
         return
       }
       this.context.$store.updateMessage({
-        stanzaId: retracted.stanzaId,
+        stanzaId: retracted.jingleId || retracted.stanzaId,
         // replace body and links
-        body: `Moderated by ${retracted.by.resource}` + (retracted.reason ? ` (${retracted.reason})` : ''),
+        body: body,
         links: [],
         status: {
           code: 'moderated',
@@ -330,6 +348,20 @@ export default {
       if (subjectChange.from && subjectChange.from.bare && subjectChange.subject) {
         this.context.$store.setRoomSubject (subjectChange.from.bare, subjectChange.from.resource, subjectChange.subject)
       }
+    })
+
+    // listen for ringing
+    this.client.on('ringing', (from, jingleId) => {
+      this.context.$oruga.modal.open({
+        component: RingingAlert,
+        hasModalCard: true,
+        trapFocus: true,
+        props: {
+          from,
+          jingleId,
+        }
+      })
+      console.log('RINGING!!!', from)
     })
 
     // listen for sent message errors
@@ -743,6 +775,15 @@ export default {
   // Set nickname
   setNick (nick) {
     this.nick = nick
+  },
+
+  async sendCallDeclined(to, id) {
+    console.log(id)
+    return this.client.sendCallDeclined(to, id)
+  },
+
+  async sendCallAccepted(to, id) {
+    return this.client.sendCallAccepted(to, id)
   },
 
 }

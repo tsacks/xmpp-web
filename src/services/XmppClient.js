@@ -50,6 +50,14 @@ const NS = {
   MESSAGE_RETRACTED: 'urn:xmpp:message-retract:0',
   // XEP-0444
   REACTIONS: 'urn:xmpp:reactions:0',
+  // XEP-0166 Jingle
+  JINGLE: 'urn:xmpp:jingle:1',
+  // XEP-0167 Jingle RTP Sessions
+  JINGLE_RTP: 'urn:xmpp:jingle:apps:rtp:1',
+  JINGLE_RTP_AUDIO: 'urn:xmpp:jingle:apps:rtp:audio',
+  JINGLE_RTP_VIDEO: 'urn:xmpp:jingle:apps:rtp:video',
+  // XEP-0353 Jingle Message Initiation
+  JINGLE_MESSAGE: 'urn:xmpp:jingle-message:0',
 }
 
 let xmppClient = null
@@ -74,6 +82,7 @@ class XmppClient {
       'chatState': [],
       'reactions': [],
       'subjectChange': [],
+      'ringing': [],
     }
     this.jid = {}
     this.uploadService = null
@@ -92,6 +101,29 @@ class XmppClient {
       this.xmpp.on('status', status => console.debug('0-status', status))
     }
     this.xmpp.on('stanza', this.parseStanza)
+    //According to [XEP-0166 Jingle], we need to be able to respond to disco#info requests
+    //This function is a callback for responding, and lists all of the features supported
+    this.xmpp.iqCallee.get(NS.DISCO_INFO, 'query', (ctx) => {
+      return xml(
+        'query', { xmlns: NS.DISCO_ITEMS },
+        xml(
+          'identity', { category: 'client', type: 'web', name: config.name }
+        ),
+        ...[
+          NS.DISCO_INFO,
+          NS.DISCO_ITEMS,
+          NS.MUC,
+          NS.JINGLE,
+          NS.JINGLE_RTP,
+          NS.JINGLE_RTP_AUDIO,
+          NS.JINGLE_RTP_VIDEO,
+        ].map( (cap) => {
+          return xml(
+            'feature', { var: cap }
+          )
+        }),
+      )
+    })
   }
 
   parseJid (jid) {
@@ -233,6 +265,56 @@ class XmppClient {
       }
 
       xmppClient.callbacks.chat.forEach((callback) => callback(message))
+    }
+    
+    // According to [XEP-0353 Jingle Message Initiation], we need to support two kinds of messages with different child elements:
+    // 1) <proposal/>, this is the caller starting a call, and we can use it to show a call starting in the chat history
+    const proposal = stanza.getChild('propose')
+    if (proposal) {
+      const archived = stanza.parent?.parent?.attrs.xmlns === NS.MAM || false
+      //console.log('Detected Proposal: ', proposal.attrs.id)
+      message.body = "PHONE CALL"
+      message.from = xmppClient.parseJid(stanza.attrs.from)
+      message.to = xmppClient.parseJid(stanza.attrs.to || xmppClient.jid)
+      message.id = stanza.attrs.id
+      message.type = stanza.attrs.type
+      message.status = 'active'
+      message.stanzaId = proposal.attrs.id
+      if(!archived) {
+        console.log('UNARCHIVED MESSAGE:', stanza )
+        this.sendRinging(message.from.full, message.stanzaId)
+        xmppClient.callbacks.ringing.forEach((callback) => callback(message.from, message.stanzaId))
+      }
+      xmppClient.callbacks.chat.forEach((callback) => callback(message))
+    }
+
+    // 2) <retraction/>, this is the caller cancelling their call, and letting us know the call is over.
+    // We also use this element to determine that the call is over.
+    // If there is no <retraction/> we have to assume that the call is still happening, and UI should reflect.
+    const retraction = stanza.getChild('retract')
+    if (retraction) {
+      //console.log('Detected Retraction: ',retraction.attrs.id)
+      //console.log('retraction', retraction.attrs.xmlns === NS.MESSAGE_RETRACTED, 'missed call', retraction.attrs.xmlns === NS.JINGLE_MESSAGE)
+      const retracted = {
+        id: stanza.attrs.id,
+        from: xmppClient.parseJid(stanza.attrs.from).bare,
+        reason: retraction.getChild('reason') || null,
+        to: xmppClient.parseJid(stanza.attrs.to).bare,
+      }
+      switch(retraction.attrs.xmlns) {
+        case NS.MESSAGE_RETRACTED:
+            const stanzaIdNode = stanza.getChild('stanza-id')
+            if (stanzaIdNode) {
+              retracted.stanzaId = stanzaIdNode.attrs.id
+            }
+          break
+        case NS.JINGLE_MESSAGE:
+          retracted.jingleId = retraction.attrs.id
+          break
+      }
+      
+      //console.log('retraction',retracted)
+      xmppClient.callbacks.messageRetracted.forEach((callback) => callback(retracted))
     }
 
     // check message fasten (XEP-0422)
@@ -1020,6 +1102,76 @@ class XmppClient {
       ),
     )
     await this.xmpp.iqCaller.request(setRoomConfigMessage)
+  }
+
+  //Per [XEP-0353 Jingle Message Initiation], we need to be able to send three types of response messages:
+  // 1) <ringing/>, tells the caller that we support XEP-0353 and that we are currently ringing our user
+  // (XEP-0353 specifically calls out that it isn't advertised, and support is only revealed this way.)
+  async sendRinging(to, id) {
+    const ringingMessage = xml(
+      'message', {
+        from: this.jid.full,
+        to,
+        type: 'chat',
+      },
+      xml(
+        'ringing', {
+          xmlns: NS.JINGLE_MESSAGE,
+          id,
+        },
+      ),
+      xml(
+        'store', {
+          xmlns: NS.STORE
+        }
+      )
+    )
+    await this.xmpp.send(ringingMessage)
+  }
+
+  // 2) <proceed/>, tells the caller we're accepting the call, and proceed to regular Jingle negotiation
+  // (This allows the caller to know specifically which resource is accepting the call, reduces the number of negotiation attempts)
+  async sendCallAccepted(to, id) {
+    const acceptMessage = xml(
+      'message', {
+        from: this.jid.full,
+        to: to.full,
+        type: 'chat',
+      },
+      xml(
+        'proceed', {
+          xmlns: NS.JINGLE_MESSAGE,
+          id,
+        },
+      ),
+      xml(
+        'store', {
+          xmlns: NS.STORE
+        }
+      )
+    )
+    await this.xmpp.send(acceptMessage)
+  }
+
+  // 3) <reject/>, which tells the caller we are unable to accept the call
+  // (XEP-0353 calls out that responding with anything other than <busy/> can reveal private information.
+  // We might want to also be able to respond with <declined/>, but would have to be a clear option.)
+  async sendCallDeclined(to, id) {
+    const declineMessage = xml(
+      'message', {
+        from: this.jid.full,
+        to: to.full,
+        type: 'chat',
+      },
+      xml('reject', {id: id, xmlns: NS.JINGLE_MESSAGE},
+        xml('reason',{xmlns: NS.JINGLE},
+          xml('busy'),
+          xml('text',{},'Busy'),
+        )
+      ),
+      xml('store', {xmlns: NS.STORE})
+    )
+    await this.xmpp.send(declineMessage)
   }
 
 }
